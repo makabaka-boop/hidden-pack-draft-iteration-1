@@ -39,7 +39,7 @@ async def test_restart_recovers_pending_round(tmp_path):
     state0 = await get_state(srv.http, game_id, players[0]["token"])
     assert state0["status"] == "active" and state0["round"] == 1
     assert state0["your_pick"]["id"] == pick0
-    assert state0["your_pack"] == []  # already picked: no pack shown
+    assert len(state0["your_pack"]) == 5  # own pack stays visible for re-picks
     state2 = await get_state(srv.http, game_id, players[2]["token"])
     assert state2["your_pick"] is None
     assert len(state2["your_pack"]) == 5  # still pending, decision intact

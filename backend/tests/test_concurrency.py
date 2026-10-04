@@ -134,11 +134,12 @@ async def test_reconnect_resubmit_is_idempotent(server):
     await client.until(lambda m: m.get("type") == "pick_ack")
     await client.ws.close()
 
-    # Reconnect: the snapshot must show the recorded pick, not the pack.
+    # Reconnect: the snapshot must show the recorded pick, and the owner's
+    # own pack stays visible so they can review it (and change the pick).
     client2 = await ws_connect(srv, game_id, 0, players[0]["token"])
     snap2 = await client2.latest_snapshot(round=1)
     assert snap2["your_pick"]["id"] == card
-    assert snap2["your_pack"] == []
+    assert len(snap2["your_pack"]) == 5
 
     # Resubmitting a different card after reconnect changes nothing.
     await client2.send({"type": "pick", "card": "c99", "round": 1})

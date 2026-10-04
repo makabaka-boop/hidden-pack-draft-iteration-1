@@ -10,6 +10,14 @@ Hidden-information invariant: the ONLY function that produces client-bound
 state is `Game.snapshot_for(seat)`. It never includes other players' current
 packs or the current round's unrevealed picks. Error messages raised as
 `GameError` carry a code and a generic message with no card data.
+
+Change-pick: a seat that MANUALLY submitted for the current, not yet
+revealed round may privately switch its pick to another card of its own
+current pack (`change_pick`). Each change bumps the pick's revision and
+appends an immutable `pick_changed` event in the same commit; auto-picked
+(timeout) seats are locked. Races with the 4th submission or the timeout
+are decided by the per-game lock in GameManager — whoever commits first
+wins, and a losing change leaves passing and public results untouched.
 """
 from __future__ import annotations
 
@@ -52,6 +60,13 @@ class PickResult:
     resolved: bool  # True if this pick completed the round
 
 
+@dataclass
+class ChangeResult:
+    card: str
+    revision: int  # revision of the pick after this change
+    already: bool  # True if this exact change had already been applied
+
+
 def stable_auto_pick(pack: list[str]) -> str:
     """Deterministic timeout rule: smallest card id in the pack.
 
@@ -72,6 +87,7 @@ class Game:
         self.round_no = 0
         self.packs: dict[int, list[str]] = {}  # SECRET: current pack per seat
         self.picks: dict[int, str] = {}  # SECRET until reveal
+        self.revisions: dict[int, int] = {}  # change-count of each pending pick
         self.auto_seats: set[int] = set()
         self.deadline: float | None = None
         self.revealed: list[dict] = []  # public: {"round", "picks", "auto"}
@@ -137,6 +153,45 @@ class Game:
             raise GameError("game_not_active", "the game is not accepting picks")
         raise GameError("round_not_active", "that round is not accepting picks")
 
+    def change_pick(
+        self, seat: int, card_id: str, round_no: int, expected_revision: int
+    ) -> ChangeResult:
+        """Privately change a pending manual pick before the round reveals.
+
+        Only a seat that has manually submitted for the CURRENT, not yet
+        revealed round may change; the new card must come from that seat's
+        original pack for the round. The update, the revision bump and the
+        immutable event are persisted in one commit. If the reveal (4th pick
+        or timeout) won the race for the per-game lock, the round has moved
+        on and the change fails without touching anything.
+        """
+        if self.status == "active" and round_no == self.round_no:
+            if seat not in self.picks:
+                raise GameError("no_pick_to_change", "you have not submitted a pick this round")
+            if seat in self.auto_seats:
+                raise GameError("auto_pick_locked", "a timeout auto-pick cannot be changed")
+            current_revision = self.revisions.get(seat, 1)
+            # Idempotent retry of a change that was already applied (e.g. the
+            # ack was lost to a disconnect): same card, revision moved by one.
+            if self.picks[seat] == card_id and current_revision == expected_revision + 1:
+                return ChangeResult(card=card_id, revision=current_revision, already=True)
+            if expected_revision != current_revision:
+                raise GameError(
+                    "revision_conflict", "your pick changed since you loaded it; retry"
+                )
+            if card_id not in self.packs.get(seat, []):
+                raise GameError("card_not_in_pack", "that card is not in your current pack")
+            if card_id == self.picks[seat]:
+                raise GameError("no_change", "that card is already your current pick")
+            self.picks[seat] = card_id
+            self.revisions[seat] = self.store.change_pick(
+                self.id, round_no, seat, card_id, expected_revision
+            )
+            return ChangeResult(card=card_id, revision=self.revisions[seat], already=False)
+        # The round already revealed (or never existed): the change loses the
+        # race and must not alter passing or public results.
+        raise GameError("round_not_active", "that round is not accepting changes")
+
     def force_timeout(self, round_no: int, now: float) -> bool:
         """Auto-pick for everyone who has not picked, then resolve. Returns
         True if the round was resolved by this call. No-op if the round moved
@@ -152,6 +207,7 @@ class Game:
 
     def _record_pick(self, seat: int, card_id: str, auto: bool) -> None:
         self.picks[seat] = card_id
+        self.revisions[seat] = 1
         if auto:
             self.auto_seats.add(seat)
         self.store.record_pick(self.id, self.round_no, seat, card_id, auto)
@@ -168,6 +224,7 @@ class Game:
         for seat, card in picks.items():
             self.final_picks[seat].append(card)
         self.picks = {}
+        self.revisions = {}
         self.auto_seats = set()
         if self.round_no >= ROUNDS:
             self.status = "finished"
@@ -192,7 +249,7 @@ class Game:
     # -- client-visible state (the ONLY serialization allowed to clients) --
 
     def snapshot_for(self, seat: int, now: float) -> dict:
-        pending = self.status == "active" and seat not in self.picks
+        active = self.status == "active"
         return {
             "type": "snapshot",
             "game_id": self.id,
@@ -203,15 +260,19 @@ class Game:
                     "seat": s,
                     "name": p.name,
                     "connected": s in self.connected,
-                    "submitted": self.status == "active" and s in self.picks,
+                    "submitted": active and s in self.picks,
                 }
                 for s, p in sorted(self.players.items())
             ],
             "round": self.round_no,
             "rounds_total": ROUNDS,
-            "your_pack": [card_public(c) for c in self.packs.get(seat, [])] if pending else [],
+            # The owner's own pack is always visible while the round is
+            # active, so they can review it and privately change their pick.
+            "your_pack": [card_public(c) for c in self.packs.get(seat, [])] if active else [],
             "your_pick": card_public(self.picks[seat]) if seat in self.picks else None,
             "your_pick_auto": seat in self.auto_seats,
+            "your_pick_revision": self.revisions.get(seat) if seat in self.picks else None,
+            "can_change_pick": active and seat in self.picks and seat not in self.auto_seats,
             "your_picks_all": [card_public(c) for c in self.final_picks.get(seat, [])],
             "revealed": [
                 {
@@ -266,8 +327,14 @@ class Game:
             elif type_ == "pick_submitted":
                 if payload["round"] == game.round_no:
                     game.picks[payload["seat"]] = payload["card"]
+                    game.revisions[payload["seat"]] = 1
                     if payload["auto"]:
                         game.auto_seats.add(payload["seat"])
+            elif type_ == "pick_changed":
+                if payload["round"] == game.round_no:
+                    # Replay restores the LATEST pending pick and its revision.
+                    game.picks[payload["seat"]] = payload["card"]
+                    game.revisions[payload["seat"]] = payload["revision"]
             elif type_ == "round_revealed":
                 picks = {int(s): c for s, c in payload["picks"].items()}
                 game.revealed.append(
@@ -276,6 +343,7 @@ class Game:
                 for seat, card in picks.items():
                     game.final_picks[seat].append(card)
                 game.picks = {}
+                game.revisions = {}
                 game.auto_seats = set()
             elif type_ == "game_finished":
                 game.status = "finished"
@@ -401,6 +469,23 @@ class GameManager:
                 snapshots = self._snapshots(game)
         if snapshots:
             await self._dispatch(game_id, snapshots)
+        return result
+
+    async def change_pick(
+        self, game_id: str, seat: int, card_id: str, round_no: int, expected_revision: int
+    ) -> ChangeResult:
+        """Private re-pick before reveal. Races with the 4th submission or
+        the timeout are decided by the same per-game lock: whoever commits
+        first wins. Only the changer's own connections get a fresh snapshot —
+        other players must not even notice that a change happened."""
+        async with self._lock_for(game_id):
+            game = self._get(game_id)
+            result = game.change_pick(seat, card_id, round_no, expected_revision)
+            snapshot = None
+            if not result.already:
+                snapshot = game.snapshot_for(seat, time.time())
+        if snapshot:
+            await self._dispatch(game_id, {seat: snapshot})
         return result
 
     # -- connections --------------------------------------------------------

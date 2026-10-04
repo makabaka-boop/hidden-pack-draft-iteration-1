@@ -97,11 +97,12 @@ function JoinScreen({ onJoined }) {
 }
 
 function GameScreen({ session, onLeave }) {
-  const { snapshot, connected, clockOffset, sendPick } = useGameSocket(
+  const { snapshot, connected, clockOffset, sendPick, sendChangePick } = useGameSocket(
     session.gameId,
     session.token
   );
   const [pendingCard, setPendingCard] = useState(null);
+  const [changing, setChanging] = useState(false);
   const [now, setNow] = useState(Date.now() / 1000);
 
   useEffect(() => {
@@ -114,6 +115,12 @@ function GameScreen({ session, onLeave }) {
     if (snapshot?.your_pick) setPendingCard(null);
   }, [snapshot?.your_pick, snapshot?.round]);
 
+  // A change is done once the server snapshot acknowledges the new revision
+  // (or the round moved on without us).
+  useEffect(() => {
+    setChanging(false);
+  }, [snapshot?.your_pick_revision, snapshot?.round]);
+
   const remaining = useMemo(() => {
     if (!snapshot?.deadline) return null;
     return Math.max(0, snapshot.deadline - (now + clockOffset));
@@ -124,11 +131,24 @@ function GameScreen({ session, onLeave }) {
   const me = snapshot.you;
   const picked = snapshot.your_pick || (pendingCard ? { id: pendingCard } : null);
   const canPick = snapshot.status === "active" && !picked && snapshot.your_pack.length > 0;
+  // Manually submitted and the round is still unrevealed: may switch to
+  // another card of the same pack. Auto (timeout) picks are locked.
+  const canChange = snapshot.can_change_pick === true && !changing;
 
   const pick = (cardId) => {
     if (!canPick) return;
     setPendingCard(cardId);
     sendPick(cardId, snapshot.round);
+  };
+
+  const change = async (cardId) => {
+    if (!canChange || snapshot.your_pick?.id === cardId) return;
+    setChanging(true);
+    try {
+      await sendChangePick(cardId, snapshot.round, snapshot.your_pick_revision);
+    } finally {
+      setChanging(false);
+    }
   };
 
   return (
@@ -177,24 +197,32 @@ function GameScreen({ session, onLeave }) {
             <section className="panel">
               <h2>
                 {picked
-                  ? `已选择 ${picked.name || picked.id}${snapshot.your_pick_auto ? "（超时自动）" : ""}，等待其他玩家…`
+                  ? `已选择 ${picked.name || picked.id}${
+                      snapshot.your_pick_auto
+                        ? "（超时自动，不可改选）"
+                        : snapshot.can_change_pick
+                          ? "（揭晓前可点击其他牌改选）"
+                          : ""
+                    }，等待其他玩家…`
                   : "选择一张牌"}
               </h2>
               <div className="pack">
-                {snapshot.your_pack.map((card) => (
-                  <button
-                    key={card.id}
-                    className="card"
-                    disabled={!canPick}
-                    onClick={() => pick(card.id)}
-                  >
-                    <span className="card-name">{card.name}</span>
-                    <span className="card-meta">力量 {card.power} · {card.id}</span>
-                  </button>
-                ))}
-                {snapshot.your_pack.length === 0 && (
-                  <p className="muted">本轮已提交，公开后自动进入下一轮。</p>
-                )}
+                {snapshot.your_pack.map((card) => {
+                  const isPicked = picked?.id === card.id;
+                  const clickable = canPick || (canChange && !isPicked);
+                  return (
+                    <button
+                      key={card.id}
+                      className={"card" + (isPicked ? " selected" : "")}
+                      disabled={!clickable}
+                      onClick={() => (canPick ? pick(card.id) : change(card.id))}
+                    >
+                      <span className="card-name">{card.name}</span>
+                      <span className="card-meta">力量 {card.power} · {card.id}</span>
+                      {isPicked && <span className="card-tag">当前选择</span>}
+                    </button>
+                  );
+                })}
               </div>
             </section>
           )}

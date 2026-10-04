@@ -192,7 +192,7 @@ def load_truth(db_path: str, game_id: str) -> dict:
         "SELECT type, payload FROM events WHERE game_id = ? ORDER BY seq", (game_id,)
     ).fetchall()
     conn.close()
-    truth: dict = {"packs": {}, "picks": {}, "revealed": set(), "events": rows}
+    truth: dict = {"packs": {}, "picks": {}, "revisions": {}, "revealed": set(), "events": rows}
     for row in rows:
         payload = json.loads(row["payload"])
         if row["type"] == "round_started":
@@ -201,6 +201,10 @@ def load_truth(db_path: str, game_id: str) -> dict:
             }
         elif row["type"] == "pick_submitted":
             truth["picks"].setdefault(payload["round"], {})[payload["seat"]] = payload["card"]
+            truth["revisions"][(payload["round"], payload["seat"])] = 1
+        elif row["type"] == "pick_changed":
+            truth["picks"].setdefault(payload["round"], {})[payload["seat"]] = payload["card"]
+            truth["revisions"][(payload["round"], payload["seat"])] = payload["revision"]
         elif row["type"] == "round_revealed":
             truth["revealed"].add(payload["round"])
     return truth

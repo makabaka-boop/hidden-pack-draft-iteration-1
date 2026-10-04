@@ -30,3 +30,47 @@ def test_event_log_roundtrip(tmp_path):
     assert [e["type"] for e in events] == ["player_joined", "game_started"]
     assert [e["seq"] for e in events] == [1, 2]
     store.close()
+
+
+def test_change_pick_backstop(tmp_path):
+    """The picks table rejects stale-revision and auto-pick changes even if
+    the in-memory guards were bypassed; the failed update appends no event."""
+    store = EventStore(str(tmp_path / "s.db"))
+    store.create_game("g1", 30.0)
+    store.record_pick("g1", 1, 0, "c01", auto=False)
+
+    # Happy path: update + revision bump + event, all in one commit.
+    assert store.change_pick("g1", 1, 0, "c02", expected_revision=1) == 2
+    assert store.count_events("g1", "pick_changed") == 1
+
+    # Stale expected revision: rejected, no event appended.
+    with pytest.raises(sqlite3.IntegrityError):
+        store.change_pick("g1", 1, 0, "c03", expected_revision=1)
+    assert store.count_events("g1", "pick_changed") == 1
+
+    # Auto-picked rows are locked against changes.
+    store.record_pick("g1", 1, 1, "c05", auto=True)
+    with pytest.raises(sqlite3.IntegrityError):
+        store.change_pick("g1", 1, 1, "c06", expected_revision=1)
+    assert store.count_events("g1", "pick_changed") == 1
+    store.close()
+
+
+def test_revision_column_migrates_existing_db(tmp_path):
+    """A database created before the revision column existed is upgraded."""
+    path = str(tmp_path / "s.db")
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE picks (game_id TEXT NOT NULL, round INTEGER NOT NULL,"
+        " seat INTEGER NOT NULL, card TEXT NOT NULL, auto INTEGER NOT NULL,"
+        " PRIMARY KEY (game_id, round, seat))"
+    )
+    conn.execute(
+        "INSERT INTO picks VALUES ('g1', 1, 0, 'c01', 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = EventStore(path)  # migration runs on open
+    assert store.change_pick("g1", 1, 0, "c02", expected_revision=1) == 2
+    store.close()

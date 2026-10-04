@@ -42,9 +42,17 @@ CREATE TABLE IF NOT EXISTS picks (
     seat    INTEGER NOT NULL,
     card    TEXT NOT NULL,
     auto    INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (game_id, round, seat)
 );
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the first schema version."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(picks)")}
+    if "revision" not in cols:
+        conn.execute("ALTER TABLE picks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
 
 
 class EventStore:
@@ -56,6 +64,7 @@ class EventStore:
         self._lock = threading.Lock()
         with self._lock, self._conn:
             self._conn.executescript(SCHEMA)
+            _migrate(self._conn)
 
     # -- writes ---------------------------------------------------------
 
@@ -97,7 +106,8 @@ class EventStore:
         """
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT INTO picks (game_id, round, seat, card, auto) VALUES (?,?,?,?,?)",
+                "INSERT INTO picks (game_id, round, seat, card, auto, revision)"
+                " VALUES (?,?,?,?,?,1)",
                 (game_id, round_no, seat, card, int(auto)),
             )
             self._append_locked(
@@ -105,6 +115,78 @@ class EventStore:
                 "pick_submitted",
                 {"round": round_no, "seat": seat, "card": card, "auto": auto},
             )
+
+    def change_pick(
+        self, game_id: str, round_no: int, seat: int, card: str, expected_revision: int
+    ) -> int:
+        """Update a manual pick to a new card and append the change event in
+        the same commit. Returns the new revision.
+
+        The WHERE clause re-checks the expected revision and the manual
+        (non-auto) origin of the pick as a backstop; a mismatch raises
+        sqlite3.IntegrityError and rolls the event append back with it.
+        """
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE picks SET card = ?, revision = revision + 1"
+                " WHERE game_id = ? AND round = ? AND seat = ?"
+                " AND revision = ? AND auto = 0",
+                (card, game_id, round_no, seat, expected_revision),
+            )
+            if cur.rowcount != 1:
+                raise sqlite3.IntegrityError("pick change backstop rejected the update")
+            row = self._conn.execute(
+                "SELECT revision FROM picks WHERE game_id = ? AND round = ? AND seat = ?",
+                (game_id, round_no, seat),
+            ).fetchone()
+            new_revision = row["revision"]
+            self._append_locked(
+                game_id,
+                "pick_changed",
+                {
+                    "round": round_no,
+                    "seat": seat,
+                    "card": card,
+                    "revision": new_revision,
+                },
+            )
+            return new_revision
+
+    def change_pick(
+        self, game_id: str, round_no: int, seat: int, card: str, expected_revision: int
+    ) -> int:
+        """Update a manual pick to a new card and append the change event,
+        atomically. Returns the new revision.
+
+        The WHERE clause re-checks the expected revision and the manual
+        (non-auto) origin of the pick as a backstop; a mismatch raises
+        sqlite3.IntegrityError and rolls back the event append.
+        """
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE picks SET card = ?, revision = revision + 1"
+                " WHERE game_id = ? AND round = ? AND seat = ?"
+                " AND revision = ? AND auto = 0",
+                (card, game_id, round_no, seat, expected_revision),
+            )
+            if cur.rowcount != 1:
+                raise sqlite3.IntegrityError("pick change backstop rejected the update")
+            row = self._conn.execute(
+                "SELECT revision FROM picks WHERE game_id = ? AND round = ? AND seat = ?",
+                (game_id, round_no, seat),
+            ).fetchone()
+            new_revision = row["revision"]
+            self._append_locked(
+                game_id,
+                "pick_changed",
+                {
+                    "round": round_no,
+                    "seat": seat,
+                    "card": card,
+                    "revision": new_revision,
+                },
+            )
+            return new_revision
 
     # -- reads ----------------------------------------------------------
 
