@@ -143,6 +143,30 @@ async def handle_message(websocket: WebSocket, manager: GameManager, game_id: st
             "already": result.already,
             "client_msg_id": msg.get("client_msg_id"),
         }))
+    elif msg_type == "change_pick":
+        try:
+            result = await manager.change_pick(
+                game_id,
+                seat,
+                str(msg.get("card", "")),
+                int(msg.get("round", -1)),
+                int(msg.get("expected_revision", -1)),
+            )
+        except (GameError, ValueError, TypeError) as exc:
+            code = exc.code if isinstance(exc, GameError) else "bad_request"
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "code": code,
+                "client_msg_id": msg.get("client_msg_id"),
+            }))
+            return
+        await websocket.send_text(json.dumps({
+            "type": "change_ack",
+            "round": msg.get("round"),
+            "card": result.card,
+            "revision": result.revision,
+            "client_msg_id": msg.get("client_msg_id"),
+        }))
     elif msg_type == "ping":
         await websocket.send_text(json.dumps({"type": "pong"}))
     else:

@@ -97,7 +97,7 @@ function JoinScreen({ onJoined }) {
 }
 
 function GameScreen({ session, onLeave }) {
-  const { snapshot, connected, clockOffset, sendPick } = useGameSocket(
+  const { snapshot, connected, clockOffset, sendPick, sendChange } = useGameSocket(
     session.gameId,
     session.token
   );
@@ -122,13 +122,23 @@ function GameScreen({ session, onLeave }) {
   if (!snapshot) return <div className="join-screen">连接中…</div>;
 
   const me = snapshot.you;
-  const picked = snapshot.your_pick || (pendingCard ? { id: pendingCard } : null);
+  const serverPick = snapshot.your_pick;
+  const picked = serverPick || (pendingCard ? { id: pendingCard } : null);
   const canPick = snapshot.status === "active" && !picked && snapshot.your_pack.length > 0;
+  // A manual pick can be re-selected while the round is still pending;
+  // timeout auto-picks are locked. The original pack is always visible to
+  // its owner via snapshot.your_original_pack.
+  const canChange = snapshot.status === "active" && !!serverPick && !snapshot.your_pick_auto;
 
   const pick = (cardId) => {
     if (!canPick) return;
     setPendingCard(cardId);
     sendPick(cardId, snapshot.round);
+  };
+
+  const change = (cardId) => {
+    if (!canChange || cardId === serverPick.id) return;
+    sendChange(cardId, snapshot.round, snapshot.your_pick_revision);
   };
 
   return (
@@ -177,25 +187,48 @@ function GameScreen({ session, onLeave }) {
             <section className="panel">
               <h2>
                 {picked
-                  ? `已选择 ${picked.name || picked.id}${snapshot.your_pick_auto ? "（超时自动）" : ""}，等待其他玩家…`
+                  ? `已选择 ${picked.name || picked.id}${snapshot.your_pick_auto ? "（超时自动）" : ""}${
+                      canChange ? "，公开前可改选" : "，等待其他玩家…"
+                    }`
                   : "选择一张牌"}
               </h2>
-              <div className="pack">
-                {snapshot.your_pack.map((card) => (
-                  <button
-                    key={card.id}
-                    className="card"
-                    disabled={!canPick}
-                    onClick={() => pick(card.id)}
-                  >
-                    <span className="card-name">{card.name}</span>
-                    <span className="card-meta">力量 {card.power} · {card.id}</span>
-                  </button>
-                ))}
-                {snapshot.your_pack.length === 0 && (
-                  <p className="muted">本轮已提交，公开后自动进入下一轮。</p>
-                )}
-              </div>
+              {canChange ? (
+                <>
+                  <p className="muted">
+                    本轮原包如下，点选另一张牌即可改选（当前为第 {snapshot.your_pick_revision} 版）。
+                  </p>
+                  <div className="pack">
+                    {snapshot.your_original_pack.map((card) => (
+                      <button
+                        key={card.id}
+                        className={"card" + (card.id === serverPick.id ? " selected" : "")}
+                        disabled={card.id === serverPick.id}
+                        onClick={() => change(card.id)}
+                      >
+                        <span className="card-name">{card.name}</span>
+                        <span className="card-meta">力量 {card.power} · {card.id}</span>
+                      </button>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <div className="pack">
+                  {snapshot.your_pack.map((card) => (
+                    <button
+                      key={card.id}
+                      className="card"
+                      disabled={!canPick}
+                      onClick={() => pick(card.id)}
+                    >
+                      <span className="card-name">{card.name}</span>
+                      <span className="card-meta">力量 {card.power} · {card.id}</span>
+                    </button>
+                  ))}
+                  {snapshot.your_pack.length === 0 && (
+                    <p className="muted">本轮已提交，公开后自动进入下一轮。</p>
+                  )}
+                </div>
+              )}
             </section>
           )}
 

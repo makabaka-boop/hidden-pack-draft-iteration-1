@@ -37,14 +37,21 @@ CREATE TABLE IF NOT EXISTS events (
     UNIQUE (game_id, seq)
 );
 CREATE TABLE IF NOT EXISTS picks (
-    game_id TEXT NOT NULL,
-    round   INTEGER NOT NULL,
-    seat    INTEGER NOT NULL,
-    card    TEXT NOT NULL,
-    auto    INTEGER NOT NULL,
+    game_id  TEXT NOT NULL,
+    round    INTEGER NOT NULL,
+    seat     INTEGER NOT NULL,
+    card     TEXT NOT NULL,
+    auto     INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (game_id, round, seat)
 );
 """
+
+
+class RevisionConflictError(Exception):
+    """The stored pick's revision did not match the caller's expectation
+    (or the pick is automatic / missing). Defense-in-depth backstop behind
+    the in-memory guards in Game.change_pick."""
 
 
 class EventStore:
@@ -56,6 +63,12 @@ class EventStore:
         self._lock = threading.Lock()
         with self._lock, self._conn:
             self._conn.executescript(SCHEMA)
+            # Migration for databases created before picks.revision existed.
+            cols = {row[1] for row in self._conn.execute("PRAGMA table_info(picks)")}
+            if "revision" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE picks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"
+                )
 
     # -- writes ---------------------------------------------------------
 
@@ -97,7 +110,8 @@ class EventStore:
         """
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT INTO picks (game_id, round, seat, card, auto) VALUES (?,?,?,?,?)",
+                "INSERT INTO picks (game_id, round, seat, card, auto, revision)"
+                " VALUES (?,?,?,?,?,1)",
                 (game_id, round_no, seat, card, int(auto)),
             )
             self._append_locked(
@@ -105,6 +119,41 @@ class EventStore:
                 "pick_submitted",
                 {"round": round_no, "seat": seat, "card": card, "auto": auto},
             )
+
+    def change_pick(
+        self, game_id: str, round_no: int, seat: int, card: str, expected_revision: int
+    ) -> int:
+        """Re-point a recorded manual pick at a new card, bump its revision,
+        and append the immutable pick_changed event — all in one transaction.
+
+        The WHERE clause re-checks revision/auto as a backstop to the
+        in-memory guards; a mismatch raises RevisionConflictError and rolls
+        the whole transaction back (no update, no event). Returns the new
+        revision.
+        """
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE picks SET card = ?, revision = revision + 1 "
+                "WHERE game_id = ? AND round = ? AND seat = ? AND auto = 0 AND revision = ?",
+                (card, game_id, round_no, seat, expected_revision),
+            )
+            if cur.rowcount != 1:
+                raise RevisionConflictError(
+                    f"pick for game {game_id} round {round_no} seat {seat} "
+                    f"is not at revision {expected_revision} or is automatic"
+                )
+            new_revision = expected_revision + 1
+            self._append_locked(
+                game_id,
+                "pick_changed",
+                {
+                    "round": round_no,
+                    "seat": seat,
+                    "card": card,
+                    "revision": new_revision,
+                },
+            )
+            return new_revision
 
     # -- reads ----------------------------------------------------------
 

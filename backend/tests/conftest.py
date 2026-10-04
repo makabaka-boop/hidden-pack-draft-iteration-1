@@ -201,6 +201,8 @@ def load_truth(db_path: str, game_id: str) -> dict:
             }
         elif row["type"] == "pick_submitted":
             truth["picks"].setdefault(payload["round"], {})[payload["seat"]] = payload["card"]
+        elif row["type"] == "pick_changed":
+            truth["picks"].setdefault(payload["round"], {})[payload["seat"]] = payload["card"]
         elif row["type"] == "round_revealed":
             truth["revealed"].add(payload["round"])
     return truth

@@ -28,7 +28,7 @@ export function useGameSocket(gameId, token) {
         if (msg.type === "snapshot") {
           setSnapshot(msg);
           setClockOffset(msg.server_now - Date.now() / 1000);
-        } else if (msg.type === "pick_ack" || msg.type === "error") {
+        } else if (msg.type === "pick_ack" || msg.type === "change_ack" || msg.type === "error") {
           const resolve = pendingRef.current.get(msg.client_msg_id);
           if (resolve) {
             pendingRef.current.delete(msg.client_msg_id);
@@ -65,5 +65,30 @@ export function useGameSocket(gameId, token) {
     });
   }, []);
 
-  return { snapshot, connected, clockOffset, sendPick };
+  // Re-select a card for a pick already submitted this round. The server
+  // answers with change_ack (and a fresh snapshot) or an error; a dropped
+  // socket is covered by the reconnect snapshot like with picks.
+  const sendChange = useCallback((cardId, round, expectedRevision) => {
+    const clientMsgId = crypto.randomUUID();
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: "change_pick",
+          card: cardId,
+          round,
+          expected_revision: expectedRevision,
+          client_msg_id: clientMsgId,
+        })
+      );
+    }
+    return new Promise((resolve) => {
+      pendingRef.current.set(clientMsgId, resolve);
+      setTimeout(() => {
+        if (pendingRef.current.delete(clientMsgId)) resolve(null);
+      }, 5000);
+    });
+  }, []);
+
+  return { snapshot, connected, clockOffset, sendPick, sendChange };
 }
